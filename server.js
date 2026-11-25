@@ -240,6 +240,7 @@ async function fetchLiveModelIds() {
 // Curated chat/RP candidates based on the NVIDIA Free Endpoint
 // list supplied by the user. This is not an API-verified pricing flag.
 const FREE_CHAT_MODEL_HINTS = [
+  'z-ai/glm-5.3-flash',
   'kimi-k3.1-pro',
   'mistral-large-4',
   'minimax-m3.1-flash',
