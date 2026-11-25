@@ -183,7 +183,28 @@ app.use((req, res, next) => {
 // the startup validateModels() check and the GET /v1/models?live=true route
 // below, so there's one implementation of "ask NIM what's actually there"
 // instead of two that can quietly drift apart.
-async function fetchLiveModelIds() {
+// ─── Dynamic Model Catalog ────────────────────────────────────────────────
+
+const MODEL_CACHE_TTL_MS =
+  Number(process.env.MODEL_CACHE_TTL_MS) || 10 * 60 * 1000;
+
+const DYNAMIC_MODELS_ENABLED =
+  process.env.DYNAMIC_MODELS_ENABLED !== 'false';
+
+let modelCatalogCache = {
+  ids: [],
+  fetchedAt: 0
+};
+
+async function fetchLiveModelCatalog(force = false) {
+  if (
+    !force &&
+    modelCatalogCache.ids.length > 0 &&
+    Date.now() - modelCatalogCache.fetchedAt < MODEL_CACHE_TTL_MS
+  ) {
+    return modelCatalogCache.ids;
+  }
+
   const response = await axios.get(`${NIM_API_BASE}/models`, {
     headers: {
       Authorization: `Bearer ${NIM_API_KEY}`,
@@ -192,7 +213,55 @@ async function fetchLiveModelIds() {
     timeout: VALIDATION_TIMEOUT_MS
   });
 
-  return new Set((response.data.data || []).map(m => m.id));
+  const ids = [
+    ...new Set(
+      (response.data.data || [])
+        .map(m => m.id)
+        .filter(Boolean)
+    )
+  ];
+
+  modelCatalogCache = {
+    ids,
+    fetchedAt: Date.now()
+  };
+
+  console.log(`[DISCOVERY] Catalog refreshed: ${ids.length} model IDs`);
+
+  return ids;
+}
+
+async function fetchLiveModelIds() {
+  return new Set(await fetchLiveModelCatalog());
+}
+
+// ─── Free Chat Model Filter ───────────────────────────────────────────────
+
+// Curated chat/RP candidates based on the NVIDIA Free Endpoint
+// list supplied by the user. This is not an API-verified pricing flag.
+const FREE_CHAT_MODEL_HINTS = [
+  'kimi-k3.1-pro',
+  'mistral-large-4',
+  'minimax-m3.1-flash',
+  'nemotron-3.5-super-vl-120b-a12b',
+  'step-5',
+  'glm-5-3-flash',
+  'nemotron-3.5-lightning-30b-a3b',
+  'nemotron-3-ultra-550b-a55b',
+  'laguna-xs-2.1',
+  'nemotron-3.5-bolt-e4b'
+];
+
+function getDynamicChatModels(ids) {
+  if (!DYNAMIC_MODELS_ENABLED) return [];
+
+  return ids.filter(id => {
+    const normalized = id.toLowerCase();
+
+    return FREE_CHAT_MODEL_HINTS.some(hint =>
+      normalized.includes(hint.toLowerCase())
+    );
+  });
 }
 
 async function validateModels() {
@@ -361,59 +430,81 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.6.0' });
+  res.json({
+    status: 'ok',
+    version: '2.7.0-dynamic-catalog'
+  });
 });
 
-app.get('/v1/models', async (req, res) => {
-  // Default: static list, no network round trip. Kept fast so clients that
-  // ping this route on startup aren't affected by the live check's latency.
-  if (req.query.live !== 'true') {
-    return res.json({
-      object: 'list',
-      data: Object.keys(MODEL_MAPPING).map(id => ({
-        id,
-        object: 'model',
-        // OpenAI's spec documents this field in Unix seconds, not milliseconds
-        // — Date.now() alone is 1000x too large and inconsistent with the
-        // correctly-converted timestamp used below in the chat completions
-        // response.
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'nim-proxy'
-      }))
-    });
-  }
+// ─── Dynamic Models Endpoint ─────────────────────────────────────────────
 
-  // ?live=true cross-checks every alias's backend model ID against NIM's
-  // current catalog on demand, instead of only at startup (validateModels())
-  // or discovering a deprecated model ID by accident on the next chat
-  // request, when it would silently fall through to FALLBACK_MODELS.
+app.get('/v1/models', async (req, res) => {
   try {
-    const availableModels = await fetchLiveModelIds();
-    const data = Object.entries(MODEL_MAPPING).map(([id, backend]) => ({
+    const liveIds = await fetchLiveModelCatalog();
+    const dynamicIds = getDynamicChatModels(liveIds);
+
+    // Preserve legacy aliases.
+    const aliasModels = Object.keys(MODEL_MAPPING).map(id => ({
       id,
       object: 'model',
       created: Math.floor(Date.now() / 1000),
       owned_by: 'nim-proxy',
-      backend,
-      available: availableModels.has(backend)
+      model_type: 'alias'
     }));
+
+    // Expose actual NIM model IDs.
+    const dynamicModels = dynamicIds.map(id => ({
+      id,
+      object: 'model',
+      created: Math.floor(Date.now() / 1000),
+      owned_by: 'nvidia',
+      model_type: 'dynamic',
+      free_status: 'unverified'
+    }));
+
+    // Prevent duplicate IDs between aliases and catalog.
+    const combined = new Map();
+
+    for (const model of aliasModels) {
+      combined.set(model.id, model);
+    }
+
+    for (const model of dynamicModels) {
+      if (!combined.has(model.id)) {
+        combined.set(model.id, model);
+      }
+    }
+
+    const data = [...combined.values()];
 
     res.json({
       object: 'list',
       data,
-      live_check: {
-        checked_at: new Date().toISOString(),
-        unavailable_aliases: data.filter(m => !m.available).map(m => m.id)
+      catalog: {
+        dynamic_enabled: DYNAMIC_MODELS_ENABLED,
+        total_catalog_models: liveIds.length,
+        total_chat_candidates: dynamicIds.length,
+        total_aliases: aliasModels.length,
+        checked_at: new Date(modelCatalogCache.fetchedAt).toISOString(),
+        cache_ttl_ms: MODEL_CACHE_TTL_MS,
+        note: 'Catalog membership does not guarantee free access or inference availability.'
       }
     });
+
   } catch (err) {
-    console.warn(`[MODELS] Live check failed: ${err.message}`);
-    res.status(502).json({
-      error: {
-        message: `Live model check against NIM failed: ${err.message}`,
-        type: 'live_check_error',
-        code: 502
-      }
+    console.warn(`[MODELS] Dynamic catalog failed: ${err.message}`);
+
+    // If NVIDIA catalog fails, preserve the proxy's old behavior.
+    res.json({
+      object: 'list',
+      data: Object.keys(MODEL_MAPPING).map(id => ({
+        id,
+        object: 'model',
+        created: Math.floor(Date.now() / 1000),
+        owned_by: 'nim-proxy'
+      })),
+      catalog_error: err.message,
+      fallback: 'static_aliases'
     });
   }
 });
@@ -425,17 +516,52 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, max_tokens, temperature, stream, reasoning_effort } = req.body;
 
-    let primaryModel = MODEL_MAPPING[model];
-    if (!primaryModel) {
-      console.warn(`[PROXY] Unknown model alias "${model}", falling back to default: ${DEFAULT_MODEL}`);
-      primaryModel = DEFAULT_MODEL;
+        let primaryModel = MODEL_MAPPING[model];
+
+    // Allow direct calls using actual NVIDIA catalog model IDs.
+    if (!primaryModel && typeof model === 'string') {
+      try {
+        const liveIds = await fetchLiveModelCatalog();
+        const dynamicIds = getDynamicChatModels(liveIds);
+
+        if (dynamicIds.includes(model)) {
+          primaryModel = model;
+          console.log(`[DISCOVERY] Direct model selected: ${model}`);
+        }
+      } catch (err) {
+        console.warn(`[DISCOVERY] Dynamic lookup failed: ${err.message}`);
+      }
     }
 
-    // De-dupe in case the requested alias resolves to a model that's also in
-    // the fallback chain — otherwise a failure retries the identical model
-    // twice before actually diversifying.
-    const modelChain = [...new Set([primaryModel, ...FALLBACK_MODELS])];
+   // Preserve the existing default behavior for unknown model names.
+if (!primaryModel) {
+  console.warn(
+    `[PROXY] Unknown model "${model}", falling back to default: ${DEFAULT_MODEL}`
+  );
+  primaryModel = DEFAULT_MODEL;
+}
 
+// Dynamic fallback candidates are discovered from the live catalog.
+// Keep the list limited to avoid excessively long fallback chains.
+let dynamicFallbacks = [];
+
+try {
+  const liveIds = await fetchLiveModelCatalog();
+  dynamicFallbacks = getDynamicChatModels(liveIds)
+    .filter(id => id !== primaryModel)
+    .slice(0, 8);
+} catch (err) {
+  console.warn(`[DISCOVERY] Dynamic fallback unavailable: ${err.message}`);
+}
+
+// Dynamic models are prioritized before legacy fallbacks.
+const modelChain = [
+  ...new Set([
+    primaryModel,
+    ...dynamicFallbacks,
+    ...FALLBACK_MODELS
+  ])
+];
     // Forward every field the client sent (top_p, stop, seed, tools,
     // tool_choice, response_format, etc.) rather than a narrow whitelist, so
     // nothing a client relies on silently vanishes. `model` and
