@@ -782,7 +782,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   } catch (error) {
     console.error('[PROXY] Fatal error:', error.message);
-    console.error('[PROXY] NIM response:', error.response?.data);
+    console.error('[PROXY] NIM response:', JSON.stringify(error.response?.data ?? null));
 
     if (!res.headersSent) {
       // If this fires after the streaming branch already called
